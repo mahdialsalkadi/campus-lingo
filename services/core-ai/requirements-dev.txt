@@ -1,0 +1,7 @@
+# Test-only dependencies. Runtime dependencies live in requirements.txt.
+-r requirements.txt
+
+pytest>=8.2.0
+# Bundled PostgreSQL 16 + pgvector binaries so the end-to-end suite runs on
+# machines without Docker (see tests/test_api_e2e.py).
+pgserver>=0.1.4

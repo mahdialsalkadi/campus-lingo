@@ -1,0 +1,12 @@
+.pgdata/
+node_modules/
+apps/web/node_modules/
+apps/web/.next/
+apps/web/out/
+apps/web/.env.local
+.venv/
+services/core-ai/.venv/
+**/__pycache__/
+*.py[cod]
+*.log
+uploads/
