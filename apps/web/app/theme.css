@@ -1,0 +1,303 @@
+/*
+ * CampusLingo theme tokens.
+ *
+ * Light values are the default (:root); the dark palette activates when
+ * <html data-theme="dark"> is set — by ThemeToggle after hydration, and by the
+ * no-flash inline script in app/layout.tsx before first paint. Tailwind maps
+ * every color class to these variables (see tailwind.config.ts), so flipping
+ * the attribute re-themes the whole app without touching any component.
+ */
+
+:root {
+  color-scheme: light;
+
+  --cl-green: #58cc02;
+  --cl-green-dark: #46a302;
+  --cl-green-light: #89e219;
+  --cl-blue: #1cb0f6;
+  --cl-blue-dark: #1899d6;
+  --cl-red: #ff4b4b;
+  --cl-red-dark: #ea2b2b;
+  --cl-yellow: #ffc800;
+  --cl-purple: #ce82ff;
+  --cl-orange: #ff9600;
+
+  --cl-ink: #3c3c3c;
+  --cl-ink-soft: #777777;
+  --cl-ink-faint: #afafaf;
+
+  --cl-surface: #ffffff;
+  --cl-surface-muted: #f7f7f7;
+  --cl-surface-border: #e5e5e5;
+
+  --font-display:
+    "Nunito", "Baloo 2", "Segoe UI", system-ui, -apple-system, "Noto Kufi Arabic", sans-serif;
+  --font-body:
+    "Inter", "Segoe UI", system-ui, -apple-system, "Noto Naskh Arabic", sans-serif;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Brand hues stay recognisable; surfaces and text invert. */
+  --cl-green: #6fd60f;
+  --cl-green-dark: #58a802;
+  --cl-green-light: #89e219;
+  --cl-blue: #38b6ff;
+  --cl-blue-dark: #1c9ae0;
+  --cl-red: #ff6060;
+  --cl-red-dark: #e03434;
+  --cl-yellow: #ffd333;
+  --cl-purple: #d99bff;
+  --cl-orange: #ffa329;
+
+  --cl-ink: #f2f7fa;
+  --cl-ink-soft: #b8c7cf;
+  --cl-ink-faint: #7e919b;
+
+  --cl-surface: #1b262e;
+  --cl-surface-muted: #121b21;
+  --cl-surface-border: #31414c;
+}
+
+body {
+  transition:
+    background-color 0.25s ease,
+    color 0.25s ease;
+}
+
+/* ---------------------------------------------------------------------------
+ * Duolingo-style micro-interactions
+ *
+ * The 3D key-press buttons, ring counters and node pathway are Tailwind
+ * utilities (see tailwind.config.ts); the keyframes below are too complex for
+ * utility classes — victory confetti, the celebratory bounce, and the pulsing
+ * "START" bubble that Duolingo puts on the next node of the path.
+ * --------------------------------------------------------------------------- */
+
+/* Confetti: eight pieces rain diagonally with a tumble, staggered by
+   --confetti-delay so one element can host the whole burst. */
+@keyframes cl-confetti {
+  0% {
+    transform: translate3d(0, -10vh, 0) rotate(0deg);
+    opacity: 1;
+  }
+  100% {
+    transform: translate3d(var(--confetti-drift, 30px), 105vh, 0)
+      rotate(var(--confetti-spin, 720deg));
+    opacity: 0.9;
+  }
+}
+
+.confetti-piece {
+  position: absolute;
+  top: 0;
+  width: var(--confetti-size, 10px);
+  height: calc(var(--confetti-size, 10px) * 0.42);
+  border-radius: 2px;
+  background: var(--confetti-color, var(--cl-yellow));
+  animation: cl-confetti var(--confetti-duration, 2.6s) cubic-bezier(0.25, 0.6, 0.4, 1)
+    var(--confetti-delay, 0s) forwards;
+}
+
+/* The big celebratory bounce when a node is conquered. */
+@keyframes cl-victory-bounce {
+  0%, 100% {
+    transform: translateY(0) scale(1);
+  }
+  30% {
+    transform: translateY(-14px) scale(1.08);
+  }
+  55% {
+    transform: translateY(0) scale(0.96);
+  }
+  75% {
+    transform: translateY(-5px) scale(1.02);
+  }
+}
+
+.victory-bounce {
+  animation: cl-victory-bounce 0.9s ease-in-out;
+}
+
+/* START bubble: a soft, infinite heartbeat on the next available node.
+   Uses the theme's green token so dark mode inherits it automatically. */
+@keyframes cl-start-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(88, 204, 2, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 18px rgba(88, 204, 2, 0);
+  }
+}
+
+.start-pulse {
+  animation: cl-start-pulse 1.6s ease-out infinite;
+}
+
+/* Daily Warm-up banner: a golden aura around the pulsing 🧠 badge — the
+   "your memory is decaying" urgency beat of the review ritual. */
+@keyframes cl-brain-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(255, 200, 30, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 16px rgba(255, 200, 30, 0);
+  }
+}
+
+.brain-pulse {
+  animation: cl-brain-pulse 1.8s ease-out infinite;
+}
+
+/* XP float: a golden counter that drifts up and fades when a challenge is
+   graded — the "reward is variable" beat of the habit loop. */
+@keyframes cl-xp-float {
+  0% {
+    transform: translateY(6px) scale(0.9);
+    opacity: 0;
+  }
+  25% {
+    transform: translateY(-6px) scale(1.1);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(-40px) scale(1);
+    opacity: 0;
+  }
+}
+
+.xp-float {
+  animation: cl-xp-float 1.1s ease-out forwards;
+}
+
+/* Streak flame idle sway (calm) — used by StreakCalendar at rest. */
+@keyframes cl-flame-sway {
+  0%, 100% {
+    transform: scale(1) rotate(0deg);
+  }
+  50% {
+    transform: scale(1.07) rotate(2.5deg);
+  }
+}
+
+.flame-sway {
+  animation: cl-flame-sway 2s ease-in-out infinite;
+}
+
+/* Streak flame urgent flicker (day not yet secured) — same element swaps
+   animation via the .flame-urgent class when today's dot is still empty. */
+@keyframes cl-flame-urgent {
+  0%, 100% {
+    transform: scale(1.05) rotate(-3deg);
+  }
+  25% {
+    transform: scale(1.14) rotate(3deg);
+  }
+  50% {
+    transform: scale(1.08) rotate(-2deg);
+  }
+  75% {
+    transform: scale(1.12) rotate(2deg);
+  }
+}
+
+.flame-urgent {
+  animation: cl-flame-urgent 0.8s ease-in-out infinite;
+  filter: saturate(1.35);
+}
+
+/* Result drawer: slides up from the bottom edge over a dimmed backdrop —
+   Duolingo's verdict sheet. The element itself is position:fixed. */
+@keyframes cl-drawer-up {
+  0% {
+    transform: translateY(102%);
+  }
+  100% {
+    transform: translateY(0);
+  }
+}
+
+.drawer-up {
+  animation: cl-drawer-up 0.32s cubic-bezier(0.22, 1.2, 0.36, 1) forwards;
+}
+
+/* Drawer content: a soft settle after the sheet lands. */
+@keyframes cl-drawer-content {
+  0% {
+    transform: translateY(14px);
+    opacity: 0;
+  }
+  100% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.drawer-content {
+  animation: cl-drawer-content 0.4s ease-out 0.12s backwards;
+}
+
+/* Active nav icon: a small spring pop when the route matches. */
+@keyframes cl-nav-pop {
+  0% {
+    transform: scale(0.82);
+  }
+  60% {
+    transform: scale(1.12);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.nav-pop {
+  animation: cl-nav-pop 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* Accuracy ring + memory gauge: the stroke draws itself on mount. */
+@keyframes cl-ring-draw {
+  0% {
+    stroke-dashoffset: var(--ring-circumference, 999);
+  }
+}
+
+.ring-draw {
+  animation: cl-ring-draw 1.1s cubic-bezier(0.3, 0.9, 0.4, 1) 0.15s backwards;
+}
+
+/* Ingestion stepper: the active dot breathes while its stage runs. */
+@keyframes cl-step-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(28, 176, 246, 0.45);
+  }
+  60% {
+    box-shadow: 0 0 0 9px rgba(28, 176, 246, 0);
+  }
+}
+
+.step-breathe {
+  animation: cl-step-breathe 1.5s ease-out infinite;
+}
+
+/* Reduced motion: everything above becomes a calm, static state. */
+@media (prefers-reduced-motion: reduce) {
+  .confetti-piece,
+  .victory-bounce,
+  .start-pulse,
+  .brain-pulse,
+  .xp-float,
+  .flame-sway,
+  .flame-urgent,
+  .drawer-up,
+  .drawer-content,
+  .nav-pop,
+  .ring-draw,
+  .step-breathe {
+    animation: none;
+  }
+  .drawer-up {
+    transform: none;
+  }
+}

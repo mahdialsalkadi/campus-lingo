@@ -1,10 +1,17 @@
 "use client";
 
 /**
- * MATCH_MADNESS — 60-second tap-to-pair drill.
- * Tap a term, then its definition. Matching tiles burst green and raise the
- * combo multiplier; a mismatch shakes both tiles and costs a heart.
- * The round ends when every pair is matched or the countdown hits zero.
+ * MATCH_MADNESS — tap-to-pair drill with a generous, reward-driven timer.
+ *
+ * Matching is BIDIRECTIONAL: pick a term OR a definition first, then whichever
+ * tile lands second on the other column resolves the pair. Changing your mind
+ * on either side simply re-highlights that side — there is no penalty for
+ * re-selecting. Correct pairs burst emerald and add +5s to the countdown;
+ * mismatches shake red for 600ms and cost a heart.
+ *
+ * The clock is never punitive: it starts at a comfortable 60s, and reaching 0
+ * does not fail the drill. It flips to "untimed practice" (half XP) so the
+ * learner can finish cementing every concept calmly.
  */
 
 import { AnimatePresence, motion } from "framer-motion";
@@ -33,6 +40,14 @@ interface Attempt {
 
 const BASE_XP = 10;
 const MAX_MULTIPLIER = 5;
+/** Comfortable floor: the drill never gives you less than a full minute. */
+const MIN_MATCH_SECONDS = 60;
+/** Every correct match buys back this much clock. */
+const TIME_BONUS_SECONDS = 5;
+/** Mismatch feedback duration (shake + red flash). */
+const SHAKE_MS = 600;
+/** XP multiplier once the clock runs out — finish calmly, earn half. */
+const TIMED_OUT_XP_FACTOR = 0.5;
 
 export default function MatchMadness({
   challengeId,
@@ -66,9 +81,11 @@ export default function MatchMadness({
   );
 
   const totalPairs = payload.pairs.length;
-  const totalSeconds = payload.seconds > 0 ? payload.seconds : 60;
+  const totalSeconds = Math.max(payload.seconds > 0 ? payload.seconds : 0, MIN_MATCH_SECONDS);
 
-  const [selectedTerm, setSelectedTerm] = useState<Tile | null>(null);
+  // Two independent selections — either side may be picked first.
+  const [selectedLeft, setSelectedLeft] = useState<Tile | null>(null);
+  const [selectedRight, setSelectedRight] = useState<Tile | null>(null);
   const [matched, setMatched] = useState<number[]>([]);
   const [burstIds, setBurstIds] = useState<string[]>([]);
   const [shakeIds, setShakeIds] = useState<string[]>([]);
@@ -78,6 +95,9 @@ export default function MatchMadness({
   const [xpEarned, setXpEarned] = useState(0);
   const [secondsLeft, setSecondsLeft] = useState(totalSeconds);
   const [comboFlash, setComboFlash] = useState<number | null>(null);
+  /** Timestamp of the last +5s bonus, drives the floating indicator. */
+  const [timeBonus, setTimeBonus] = useState<number | null>(null);
+  const [timedOut, setTimedOut] = useState(false);
   const [finished, setFinished] = useState<{ correct: boolean; timedOut: boolean } | null>(null);
 
   const startedAt = useRef<number>(Date.now());
@@ -86,10 +106,10 @@ export default function MatchMadness({
   const misses = attempts.filter((attempt) => !attempt.correct).length;
 
   const finish = useCallback(
-    (correct: boolean, timedOut: boolean, finalAttempts: Attempt[], matchedCount: number) => {
+    (correct: boolean, didTimeOut: boolean, finalAttempts: Attempt[], matchedCount: number) => {
       if (reported.current) return;
       reported.current = true;
-      setFinished({ correct, timedOut });
+      setFinished({ correct, timedOut: didTimeOut });
       playSfx(correct ? "fanfare" : "incorrect");
       onResult({
         isCorrect: correct,
@@ -100,7 +120,7 @@ export default function MatchMadness({
           kind: "MATCH_MADNESS",
           matched: matchedCount,
           total: totalPairs,
-          timedOut,
+          timedOut: didTimeOut,
           bestCombo: maxCombo,
           xpEarned,
           attempts: finalAttempts,
@@ -110,20 +130,21 @@ export default function MatchMadness({
     [challengeId, onResult, totalPairs, maxCombo, xpEarned],
   );
 
-  // Countdown
+  // Countdown — paused the moment time runs out (practice continues untimed).
   useEffect(() => {
-    if (finished || disabled) return;
+    if (finished || disabled || timedOut) return;
     const timer = window.setInterval(() => {
       setSecondsLeft((prev) => (prev <= 1 ? 0 : prev - 1));
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [finished, disabled]);
+  }, [finished, disabled, timedOut]);
 
+  // Reaching zero is a soft, non-punitive boundary: switch to practice mode.
   useEffect(() => {
-    if (secondsLeft === 0 && !finished && !reported.current) {
-      finish(false, true, attempts, matched.length);
+    if (secondsLeft === 0 && !finished && !timedOut) {
+      setTimedOut(true);
     }
-  }, [secondsLeft, finished, attempts, matched.length, finish]);
+  }, [secondsLeft, finished, timedOut]);
 
   const resolvePair = useCallback(
     (term: Tile, definition: Tile) => {
@@ -135,18 +156,29 @@ export default function MatchMadness({
       };
       const nextAttempts = [...attempts, attempt];
       setAttempts(nextAttempts);
-      setSelectedTerm(null);
+      setSelectedLeft(null);
+      setSelectedRight(null);
 
       if (isMatch) {
         const nextCombo = combo + 1;
         const multiplier = Math.min(MAX_MULTIPLIER, nextCombo);
-        const gained = BASE_XP * multiplier;
+        const gained = Math.round(
+          (BASE_XP * multiplier) * (timedOut ? TIMED_OUT_XP_FACTOR : 1),
+        );
         setCombo(nextCombo);
         setMaxCombo((prev) => Math.max(prev, nextCombo));
         setComboFlash(multiplier);
         setXpEarned((prev) => prev + gained);
         onXp?.(gained);
         playSfx("correct");
+
+        // Reward beat: a correct match buys back clock time (never past the
+        // starting baseline) and floats a green "+5 ثوانٍ" by the timer.
+        if (!timedOut) {
+          setSecondsLeft((prev) => Math.min(prev + TIME_BONUS_SECONDS, totalSeconds));
+          setTimeBonus(Date.now());
+          window.setTimeout(() => setTimeBonus(null), 1200);
+        }
 
         const nextMatched = [...matched, term.pairIndex];
         setMatched(nextMatched);
@@ -155,45 +187,60 @@ export default function MatchMadness({
         window.setTimeout(() => setComboFlash(null), 700);
 
         if (nextMatched.length === totalPairs) {
-          finish(true, false, nextAttempts, nextMatched.length);
+          // Completing every pair is a pass even in untimed practice mode.
+          finish(true, timedOut, nextAttempts, nextMatched.length);
         }
       } else {
         setCombo(0);
         playSfx("incorrect");
         setShakeIds([term.id, definition.id]);
-        window.setTimeout(() => setShakeIds([]), 480);
+        window.setTimeout(() => setShakeIds([]), SHAKE_MS);
         onHeartLoss?.();
       }
     },
-    [attempts, combo, matched, totalPairs, finish, onHeartLoss, onXp],
+    [attempts, combo, matched, totalPairs, finish, onHeartLoss, onXp, timedOut, totalSeconds],
   );
 
+  /**
+   * Bidirectional tap handler.
+   *
+   * Selecting a side highlights it; tapping the OTHER side then evaluates the
+   * pair. Tapping a second tile on the SAME side just moves the highlight
+   * (no penalty). The counterpart selection is captured before the state
+   * update so a same-tick pair resolves correctly.
+   */
   const onTileClick = (tile: Tile, side: "term" | "definition") => {
     if (disabled || finished || matched.includes(tile.pairIndex)) return;
+    playSfx("tap");
+
     if (side === "term") {
-      playSfx("tap");
-      if (selectedTerm?.id === tile.id) {
-        setSelectedTerm(null);
+      if (selectedLeft?.id === tile.id) {
+        setSelectedLeft(null);
         return;
       }
-      setSelectedTerm(tile);
+      const pendingRight = selectedRight;
+      setSelectedLeft(tile);
+      if (pendingRight) resolvePair(tile, pendingRight);
       return;
     }
-    if (!selectedTerm) {
-      playSfx("tap");
+
+    if (selectedRight?.id === tile.id) {
+      setSelectedRight(null);
       return;
     }
-    resolvePair(selectedTerm, tile);
+    const pendingLeft = selectedLeft;
+    setSelectedRight(tile);
+    if (pendingLeft) resolvePair(pendingLeft, tile);
   };
 
   const progress = (matched.length / totalPairs) * 100;
   const timeProgress = (secondsLeft / totalSeconds) * 100;
-  const timeCritical = secondsLeft <= 10;
+  const timeCritical = !timedOut && secondsLeft <= 10;
   const multiplier = Math.min(MAX_MULTIPLIER, combo || 1);
 
   const tileClass = (tile: Tile) => {
     const isMatched = matched.includes(tile.pairIndex);
-    const isSelected = selectedTerm?.id === tile.id;
+    const isSelected = selectedLeft?.id === tile.id || selectedRight?.id === tile.id;
     const isShaking = shakeIds.includes(tile.id);
     const isBursting = burstIds.includes(tile.id);
     const base =
@@ -207,7 +254,7 @@ export default function MatchMadness({
 
   const animateFor = (tile: Tile) =>
     shakeIds.includes(tile.id)
-      ? { x: [0, -9, 9, -6, 6, 0], transition: { duration: 0.42 } }
+      ? { x: [0, -9, 9, -6, 6, 0], transition: { duration: SHAKE_MS / 1000 } }
       : burstIds.includes(tile.id)
         ? { scale: [1, 1.06, 1], transition: { duration: 0.4 } }
         : { x: 0, scale: 1 };
@@ -233,13 +280,30 @@ export default function MatchMadness({
               <Zap className="h-4 w-4" aria-hidden="true" />
               {xpEarned}
             </span>
-            <span
-              className={`flex items-center gap-1 ${
-                timeCritical ? "text-feather-red" : "text-ink-soft"
-              }`}
-            >
-              <Timer className="h-4 w-4" aria-hidden="true" />
-              {secondsLeft}s
+            <span className="relative flex items-center gap-1">
+              <span
+                className={`flex items-center gap-1 ${
+                  timeCritical ? "text-feather-red" : "text-ink-soft"
+                }`}
+              >
+                <Timer className="h-4 w-4" aria-hidden="true" />
+                {timedOut ? "∞" : `${secondsLeft}s`}
+              </span>
+              <AnimatePresence>
+                {timeBonus && !timedOut && (
+                  <motion.span
+                    key={timeBonus}
+                    initial={{ opacity: 0, y: 4, scale: 0.85 }}
+                    animate={{ opacity: 1, y: -14, scale: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.5 }}
+                    className="pointer-events-none absolute -top-1 start-0 whitespace-nowrap font-display text-[11px] font-extrabold text-feather-green-dark"
+                    role="status"
+                  >
+                    +{TIME_BONUS_SECONDS} ثوانٍ ⏱️
+                  </motion.span>
+                )}
+              </AnimatePresence>
             </span>
           </div>
         </div>
@@ -273,10 +337,25 @@ export default function MatchMadness({
             </motion.p>
           )}
         </AnimatePresence>
+
+        {/* Gentle, non-punitive timeout banner: the drill continues untimed. */}
+        <AnimatePresence>
+          {timedOut && !finished && (
+            <motion.p
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+              className="rounded-2xl border-2 border-feather-yellow/60 bg-feather-yellow/10 px-3 py-2 text-center font-body text-xs font-bold text-ink-soft"
+              role="status"
+            >
+              انتهى الوقت! أكمل المطابقة بهدوء لترسيخ المفاهيم (نصف النقاط)
+            </motion.p>
+          )}
+        </AnimatePresence>
       </header>
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <div className="flex flex-col gap-2">
+        <div className="flex flex-col gap-2" aria-label="المصطلحات">
           {termTiles.map((tile) => (
             <motion.button
               key={tile.id}
@@ -299,7 +378,7 @@ export default function MatchMadness({
             </motion.button>
           ))}
         </div>
-        <div className="flex flex-col gap-2">
+        <div className="flex flex-col gap-2" aria-label="التعريفات">
           {definitionTiles.map((tile) => (
             <motion.button
               key={tile.id}
@@ -336,14 +415,15 @@ export default function MatchMadness({
         >
           <p className="font-display text-base font-extrabold text-ink">
             {finished.correct
-              ? "ممتاز! مطابقة كاملة"
-              : finished.timedOut
-                ? "انتهى الوقت!"
-                : "أكملت المطابقة مع بعض الأخطاء"}
+              ? finished.timedOut
+                ? "أحسنت! أكملت المطابقة بهدوء"
+                : "ممتاز! مطابقة كاملة"
+              : "أكملت المطابقة مع بعض الأخطاء"}
           </p>
           <p className="mt-1 font-body text-sm text-ink-soft">
             {matched.length}/{totalPairs} أزواج · أفضل كومبو x{maxCombo || 1} · {xpEarned} XP ·{" "}
             {misses} خطأ · {Math.round((Date.now() - startedAt.current) / 1000)} ثانية
+            {finished.timedOut ? " · وضع غير موقوت (نصف XP)" : ""}
           </p>
           {misses > 0 && (
             <ul className="mt-3 flex flex-col gap-1">

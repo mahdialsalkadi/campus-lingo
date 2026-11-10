@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="CampusLingo">
+  <rect width="512" height="512" fill="#0f172a" />
+  <circle cx="256" cy="256" r="150" fill="#58CC02" />
+  <path
+    d="M216 186v122h86"
+    fill="none"
+    stroke="#0f172a"
+    stroke-width="30"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

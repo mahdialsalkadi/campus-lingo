@@ -1,6 +1,9 @@
 import type { Metadata, Viewport } from "next";
 import { cookies } from "next/headers";
+import AppShell from "@/components/AppShell";
+import PwaRegistrar from "@/components/PwaRegistrar";
 import "tailwindcss/tailwind.css";
+import "./theme.css";
 
 export const metadata: Metadata = {
   title: {
@@ -11,13 +14,26 @@ export const metadata: Metadata = {
     "CampusLingo turns university lecture PDFs into short gamified challenges with FSRS-4.5 spaced repetition.",
   applicationName: "CampusLingo",
   keywords: ["spaced repetition", "FSRS", "micro-learning", "university", "gamification"],
+  manifest: "/manifest.json",
+  icons: {
+    icon: "/icon.svg",
+    apple: "/icon.svg",
+  },
+  appleWebApp: {
+    capable: true,
+    title: "CampusLingo",
+    statusBarStyle: "black-translucent",
+  },
 };
 
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   maximumScale: 5,
-  themeColor: "#58CC02",
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#58CC02" },
+    { media: "(prefers-color-scheme: dark)", color: "#121b21" },
+  ],
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -26,35 +42,17 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   const dir = lang === "ar" ? "rtl" : "ltr";
 
   return (
-    <html lang={lang} dir={dir}>
-      <body
-        className="min-h-screen bg-surface-muted font-body text-ink antialiased"
-        style={
-          {
-            "--cl-green": "#58CC02",
-            "--cl-green-dark": "#46A302",
-            "--cl-green-light": "#89E219",
-            "--cl-blue": "#1CB0F6",
-            "--cl-blue-dark": "#1899D6",
-            "--cl-red": "#FF4B4B",
-            "--cl-red-dark": "#EA2B2B",
-            "--cl-yellow": "#FFC800",
-            "--cl-purple": "#CE82FF",
-            "--cl-orange": "#FF9600",
-            "--cl-ink": "#3C3C3C",
-            "--cl-ink-soft": "#777777",
-            "--cl-ink-faint": "#AFAFAF",
-            "--cl-surface": "#FFFFFF",
-            "--cl-surface-muted": "#F7F7F7",
-            "--cl-surface-border": "#E5E5E5",
-            "--font-display":
-              '"Nunito", "Baloo 2", "Segoe UI", system-ui, -apple-system, "Noto Kufi Arabic", sans-serif',
-            "--font-body":
-              '"Inter", "Segoe UI", system-ui, -apple-system, "Noto Naskh Arabic", sans-serif',
-          } as React.CSSProperties
-        }
-      >
-        <div className="mx-auto flex min-h-screen w-full max-w-5xl flex-col">{children}</div>
+    <html lang={lang} dir={dir} suppressHydrationWarning>
+      <body className="min-h-screen bg-surface-muted font-body text-ink antialiased">
+        {/* No-flash dark mode: applies the persisted theme before first paint.
+            `page` is the zustand-persist key for useQuizStore. */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){try{var s=JSON.parse(localStorage.getItem('campuslingo-progress-v2')||'{}');var t=(s.state&&s.state.theme)==='dark'?'dark':((s.state&&s.state.theme)==='light'?'light':(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'));document.documentElement.setAttribute('data-theme',t);}catch(e){}})();`,
+          }}
+        />
+        <AppShell>{children}</AppShell>
+        <PwaRegistrar />
       </body>
     </html>
   );

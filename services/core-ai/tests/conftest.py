@@ -6,10 +6,16 @@ provides the synthetic lecture PDF both the parser and end-to-end suites use.
 
 from __future__ import annotations
 
+import importlib.util
 import pathlib
 import sys
 
 import pytest
+
+
+def _importable(name: str) -> bool:
+    """True when the module exists without importing it (deprecation-safe)."""
+    return importlib.util.find_spec(name) is not None
 
 SERVICE_DIR = pathlib.Path(__file__).resolve().parents[1]
 REPO_ROOT = SERVICE_DIR.parents[1]
@@ -41,8 +47,10 @@ RUNNING_HEADER = "MARITIME SAFETY 2026 - LECTURE 4"
 
 @pytest.fixture(scope="session")
 def fitz_module():
-    """PyMuPDF, skipped cleanly when the dependency is absent."""
-    return pytest.importorskip("fitz", reason="PyMuPDF (pymupdf) is required")
+    """PyMuPDF (canonical ``pymupdf`` import), skipped cleanly when absent."""
+    if _importable("pymupdf"):
+        return pytest.importorskip("pymupdf", reason="PyMuPDF (pymupdf) is required")
+    return pytest.importorskip("fitz", reason="PyMuPDF (fitz) is required")
 
 
 @pytest.fixture(scope="session")

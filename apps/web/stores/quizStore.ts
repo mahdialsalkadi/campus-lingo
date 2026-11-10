@@ -1,13 +1,17 @@
 "use client";
 
 /**
- * Global gamification store: hearts, XP, streak, Mistakes Inbox and the
- * synthesized sound engine, plus the review plumbing that talks to
- * ``/api/reviews`` (FSRS-4.5 lives on the server; this store only mirrors it).
+ * Global gamification store: identity (email auth), gems, XP, streak,
+ * Mistakes Inbox and the synthesized sound engine, plus the review plumbing
+ * that talks to ``/api/reviews`` (FSRS-4.5 lives on the server; this store only
+ * mirrors it).
  *
- * Persistence: zustand/persist -> localStorage (progress + heart timestamp, so
- * a reload does not hand back free lives). Spaced-repetition truth stays in
- * PostgreSQL.
+ * Hearts are infinite: nothing in the app ever decrements them, so students can
+ * retry and learn continuously.
+ *
+ * Persistence: zustand/persist -> localStorage (identity + progress). Identity
+ * is written only after a successful POST /api/users response. Spaced-repetition
+ * truth stays in PostgreSQL.
  */
 
 import { create } from "zustand";
@@ -17,26 +21,40 @@ import {
   ApiError,
   api,
   ratingFromResult,
-  submitCardReview,
+  type AuthUserResponse,
   type ChallengePayload,
   type NodeChallengesResponse,
   type QueueItem,
   type ReviewResponse,
+  type UserStats,
 } from "@/lib/api";
+import { enqueueReview, flushReviewQueue, isOffline } from "@/lib/offline";
 
-export const MAX_HEARTS = 5;
-export const HEART_REGEN_MS = 30 * 60 * 1000; // one heart every 30 minutes
-export const HEART_REFILL_COST = 350;
 export const XP_PER_CORRECT = 10;
 export const XP_PERFECT_SESSION_BONUS = 20;
+
+/**
+ * Offline XP estimate, mirrors the server's XP_BY_RATING table. Credited
+ * optimistically so a lesson never stalls; the authoritative awards land when
+ * the queued reviews are replayed on reconnect.
+ */
+const XP_BY_RATING_FALLBACK: Record<number, number> = { 1: 0, 2: 5, 3: 10, 4: 15 };
 
 export type SfxName =
   | "tap"
   | "correct"
   | "incorrect"
   | "fanfare"
-  | "heartLost"
   | "whoosh";
+
+export type ThemeMode = "light" | "dark";
+
+/** Sync the <html data-theme> attribute that app/theme.css keys off. */
+export function applyThemeToDom(theme: ThemeMode): void {
+  if (typeof document !== "undefined") {
+    document.documentElement.setAttribute("data-theme", theme);
+  }
+}
 
 export interface SessionQueueItem {
   challengeId: string;
@@ -76,17 +94,26 @@ interface QuizState {
   gems: number;
   streak: number;
   leagueTier: number;
-  hearts: number;
-  heartsUpdatedAt: number;
   soundEnabled: boolean;
+  /** UI colour scheme; persisted so the no-flash script can restore it. */
+  theme: ThemeMode;
 
   // session
   queue: SessionQueueItem[];
   index: number;
+  /** Challenges answered correctly this session (deduplicated by id). */
+  clearedChallengeIds: string[];
   sessionXp: number;
   sessionAttempts: AttemptResult[];
   correctCount: number;
   wrongCount: number;
+  /**
+   * Questions missed during the initial pass. They seed a SINGLE one-shot
+   * remedial round once the main set is cleared (never an infinite loop).
+   */
+  roundMistakes: SessionQueueItem[];
+  /** True while the learner is working through the remedial round. */
+  inRemedial: boolean;
   activeNodeId: string | null;
   activeNodeTitle: string;
   startedAt: number | null;
@@ -99,6 +126,10 @@ interface QuizState {
   mistakes: QueueItem[];
   sessionMistakes: MistakeInboxEntry[];
 
+  // offline sync
+  /** Reviews written to localStorage while the API was unreachable. */
+  offlinePending: number;
+
   // transport
   loading: boolean;
   submitting: boolean;
@@ -106,11 +137,22 @@ interface QuizState {
 
   // actions
   ensureUser: (email?: string) => Promise<string>;
-  refreshStats: () => Promise<void>;
-  refreshHearts: () => void;
+  login: (email: string, password: string) => Promise<{ id: string; created: boolean }>;
+  register: (email: string, password: string) => Promise<{ id: string; created: boolean }>;
+  logout: () => void;
+  toggleTheme: () => void;
+  setTheme: (theme: ThemeMode) => void;
+  refreshStats: () => Promise<UserStats | null>;
   loadQueue: (limit?: number) => Promise<void>;
   loadMistakes: () => Promise<void>;
-  startNodeSession: (node: NodeChallengesResponse & { title?: string }) => void;
+  /**
+   * Start a lesson queue; ``onlyTypes`` optionally filters the node's
+   * challenges to the kinds the learner picked in the pre-session chooser.
+   */
+  startNodeSession: (
+    node: NodeChallengesResponse & { title?: string },
+    onlyTypes?: string[],
+  ) => void;
   startQueueSession: (items: QueueItem[]) => void;
   recordAttempt: (input: {
     challengeId: string;
@@ -119,16 +161,20 @@ interface QuizState {
     elapsedMs: number;
     hintsUsed?: number;
     responseJson?: unknown;
-  }) => Promise<{ rating: number; xp: number } | null>;
+  }) => Promise<{ rating: number; xp: number; offline?: boolean } | null>;
+  /** Replay offline reviews and adopt the server-authoritative XP/gems. */
+  syncOfflineReviews: () => Promise<number>;
   submitSessionRating: (rating: 1 | 2 | 3 | 4) => Promise<ReviewResponse | null>;
-  loseHeart: () => void;
   addXp: (amount: number) => void;
+  /**
+   * Advance the session. At the end of the main set, a missed question opens a
+   * single "⚡ جولة تصحيح سريعة" (remedial round) exactly once; at the end of
+   * that round (or with no mistakes) the session finishes.
+   */
   nextChallenge: () => void;
   prevChallenge: () => void;
   finishSession: () => void;
   resetSession: () => void;
-  refillHearts: () => Promise<void>;
-  grantHearts: (count?: number) => void;
   toggleSound: () => void;
   clearError: () => void;
 }
@@ -209,9 +255,6 @@ export function playSfx(name: SfxName): void {
         tone({ freq, delay: index * 0.1, duration: 0.26, type: "triangle", gain: 0.12 }),
       );
       break;
-    case "heartLost":
-      tone({ freq: 392, duration: 0.18, type: "triangle", gain: 0.1, sweepTo: 196 });
-      break;
     case "whoosh":
       tone({ freq: 1200, duration: 0.28, type: "sine", gain: 0.05, sweepTo: 220 });
       break;
@@ -224,19 +267,27 @@ export function playSfx(name: SfxName): void {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function regenerateHearts(
-  hearts: number,
-  heartsUpdatedAt: number,
-): { hearts: number; heartsUpdatedAt: number } {
-  if (hearts >= MAX_HEARTS) return { hearts: MAX_HEARTS, heartsUpdatedAt: Date.now() };
-  const now = Date.now();
-  const earned = Math.floor((now - heartsUpdatedAt) / HEART_REGEN_MS);
-  if (earned <= 0) return { hearts, heartsUpdatedAt };
-  const nextHearts = Math.min(MAX_HEARTS, hearts + earned);
-  return {
-    hearts: nextHearts,
-    heartsUpdatedAt: nextHearts >= MAX_HEARTS ? now : heartsUpdatedAt + earned * HEART_REGEN_MS,
-  };
+// ---------------------------------------------------------------------------
+// Identity helpers
+// ---------------------------------------------------------------------------
+
+export const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+export const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Credentials cached before real email auth existed — purged on startup. */
+export const LEGACY_DEFAULT_EMAIL = "student@campuslingo.local";
+
+export function isStaleIdentity(email: string | null | undefined): boolean {
+  if (!email) return false;
+  return email.trim().toLowerCase() === LEGACY_DEFAULT_EMAIL;
+}
+
+export function isValidEmail(email: string | null | undefined): boolean {
+  return !!email && EMAIL_PATTERN.test(email.trim().toLowerCase());
+}
+
+export function isValidUserId(userId: string | null | undefined): boolean {
+  return !!userId && UUID_PATTERN.test(userId);
 }
 
 function messageOf(error: unknown): string {
@@ -251,23 +302,58 @@ function messageOf(error: unknown): string {
 
 export const useQuizStore = create<QuizState>()(
   persist(
-    (set, get) => ({
+    (set, get) => {
+      /** Adopt a server-verified account into the store and reset the session. */
+      const adoptAccount = (user: AuthUserResponse) =>
+        set({
+          userId: user.id,
+          email: user.email,
+          xp: user.xp_points,
+          gems: user.gems,
+          streak: user.streak_count,
+          leagueTier: user.league_tier,
+          loading: false,
+          // a fresh identity starts with an empty workspace
+          queue: [],
+          index: 0,
+          clearedChallengeIds: [],
+          sessionXp: 0,
+          sessionAttempts: [],
+          sessionMistakes: [],
+          correctCount: 0,
+          wrongCount: 0,
+          roundMistakes: [],
+          inRemedial: false,
+          activeNodeId: null,
+          activeNodeTitle: "",
+          startedAt: null,
+          finishedAt: null,
+          lastReview: null,
+          lastXpAward: 0,
+          completedNodeIds: [],
+          mistakes: [],
+          offlinePending: 0,
+        });
+
+      return {
       userId: null,
       email: "",
       xp: 0,
       gems: 500,
       streak: 0,
       leagueTier: 0,
-      hearts: MAX_HEARTS,
-      heartsUpdatedAt: Date.now(),
       soundEnabled: true,
+      theme: "light",
 
       queue: [],
       index: 0,
+      clearedChallengeIds: [],
       sessionXp: 0,
       sessionAttempts: [],
       correctCount: 0,
       wrongCount: 0,
+      roundMistakes: [],
+      inRemedial: false,
       activeNodeId: null,
       activeNodeTitle: "",
       startedAt: null,
@@ -279,40 +365,118 @@ export const useQuizStore = create<QuizState>()(
       mistakes: [],
       sessionMistakes: [],
 
+      offlinePending: 0,
+
       loading: false,
       submitting: false,
       error: null,
 
       // -- identity --------------------------------------------------------
       ensureUser: async (email) => {
-        const current = get().userId;
         const targetEmail = (email ?? get().email).trim().toLowerCase();
-        if (!targetEmail) {
-          throw new Error("email required");
+        if (!isValidEmail(targetEmail) || isStaleIdentity(targetEmail)) {
+          throw new Error("sign in with a valid email first");
         }
-        if (current && targetEmail === get().email) return current;
+        if (get().userId && targetEmail === get().email) return get().userId as string;
+        // No cached identity: password auth means we cannot silently create
+        // or restore an account here — the caller must go through the modal.
+        throw new Error("انتهت الجلسة — سجّل الدخول من جديد");
+      },
+
+      /**
+       * Email + password sign-in via POST /api/auth/login. Identity is saved
+       * to the store (and localStorage via persist) only after the server
+       * verifies the credentials, restoring gems/XP/streak for the account.
+       */
+      login: async (rawEmail, password) => {
+        const email = rawEmail.trim().toLowerCase();
+        if (!isValidEmail(email) || isStaleIdentity(email)) {
+          throw new Error("أدخل بريد إلكتروني صحيح");
+        }
+        if (!password) throw new Error("أدخل كلمة المرور");
         set({ loading: true, error: null });
         try {
-          const user = await api.upsertUser(targetEmail);
-          set({
-            userId: user.id,
-            email: user.email,
-            xp: user.xp_points,
-            gems: user.gems,
-            streak: user.streak_count,
-            leagueTier: user.league_tier,
-            loading: false,
-          });
-          return user.id;
+          const user = await api.loginWithPassword(email, password);
+          adoptAccount(user);
+          return { id: user.id, created: user.created };
         } catch (error) {
           set({ loading: false, error: messageOf(error) });
           throw error;
         }
       },
 
+      /**
+       * Create an account with email + password via POST /api/auth/register,
+       * then adopt it (500 gems, clean workspace).
+       */
+      register: async (rawEmail, password) => {
+        const email = rawEmail.trim().toLowerCase();
+        if (!isValidEmail(email) || isStaleIdentity(email)) {
+          throw new Error("أدخل بريد إلكتروني صحيح");
+        }
+        if (password.length < 8) {
+          throw new Error("كلمة المرور يجب أن تكون 8 أحرف على الأقل");
+        }
+        set({ loading: true, error: null });
+        try {
+          const user = await api.register(email, password);
+          adoptAccount(user);
+          return { id: user.id, created: user.created };
+        } catch (error) {
+          set({ loading: false, error: messageOf(error) });
+          throw error;
+        }
+      },
+
+      /** Log out / switch account: wipe storage, reset all state, show auth. */
+      logout: () => {
+        try {
+          if (typeof window !== "undefined") {
+            useQuizStore.persist.clearStorage();
+            window.localStorage.removeItem("campuslingo-progress"); // legacy v1 key
+          }
+        } catch {
+          /* storage unavailable — still reset the in-memory state below */
+        }
+        set({
+          userId: null,
+          email: "",
+          xp: 0,
+          gems: 500,
+          streak: 0,
+          leagueTier: 0,
+          queue: [],
+          index: 0,
+          clearedChallengeIds: [],
+          sessionXp: 0,
+          sessionAttempts: [],
+          sessionMistakes: [],
+          correctCount: 0,
+          wrongCount: 0,
+          roundMistakes: [],
+          inRemedial: false,
+          activeNodeId: null,
+          activeNodeTitle: "",
+          startedAt: null,
+          finishedAt: null,
+          lastReview: null,
+          lastXpAward: 0,
+          completedNodeIds: [],
+          mistakes: [],
+          offlinePending: 0,
+          loading: false,
+          submitting: false,
+          error: null,
+        });
+      },
+
+      /**
+       * Mirror the server-authoritative profile (including passively
+       * regenerated gems from GET /api/users/{id}/stats) into the store.
+       */
       refreshStats: async () => {
         const userId = get().userId;
-        if (!userId) return;
+        if (!userId) return null;
         try {
           const stats = await api.stats(userId);
           set({
@@ -321,15 +485,11 @@ export const useQuizStore = create<QuizState>()(
             streak: stats.streak_count,
             leagueTier: stats.league_tier,
           });
+          return stats;
         } catch (error) {
           set({ error: messageOf(error) });
+          return null;
         }
-      },
-
-      refreshHearts: () => {
-        const { hearts, heartsUpdatedAt } = get();
-        const next = regenerateHearts(hearts, heartsUpdatedAt);
-        if (next.hearts !== hearts || next.heartsUpdatedAt !== heartsUpdatedAt) set(next);
       },
 
       // -- queues ----------------------------------------------------------
@@ -355,6 +515,7 @@ export const useQuizStore = create<QuizState>()(
             finishedAt: null,
             sessionAttempts: [],
             sessionMistakes: [],
+            clearedChallengeIds: [],
             sessionXp: 0,
             correctCount: 0,
             wrongCount: 0,
@@ -375,13 +536,16 @@ export const useQuizStore = create<QuizState>()(
         }
       },
 
-      startNodeSession: (node) => {
+      startNodeSession: (node, onlyTypes) => {
         const title =
           "node_title" in node && node.node_title
             ? node.node_title
             : (node as { title?: string }).title ?? "Lesson";
+        const filtered = onlyTypes?.length
+          ? node.challenges.filter((challenge) => onlyTypes.includes(challenge.type))
+          : node.challenges;
         set({
-          queue: node.challenges.map((challenge) => ({
+          queue: filtered.map((challenge) => ({
             challengeId: challenge.id,
             nodeId: node.node_id,
             nodeTitle: title,
@@ -396,9 +560,12 @@ export const useQuizStore = create<QuizState>()(
           finishedAt: null,
           sessionAttempts: [],
           sessionMistakes: [],
+          clearedChallengeIds: [],
           sessionXp: 0,
           correctCount: 0,
           wrongCount: 0,
+          roundMistakes: [],
+          inRemedial: false,
           error: null,
           lastReview: null,
         });
@@ -421,9 +588,12 @@ export const useQuizStore = create<QuizState>()(
           finishedAt: null,
           sessionAttempts: [],
           sessionMistakes: [],
+          clearedChallengeIds: [] as string[],
           sessionXp: 0,
           correctCount: 0,
           wrongCount: 0,
+          roundMistakes: [],
+          inRemedial: false,
           error: null,
           lastReview: null,
         });
@@ -446,20 +616,34 @@ export const useQuizStore = create<QuizState>()(
         if (isCorrect) {
           set((prev) => ({
             correctCount: prev.correctCount + 1,
+            // Mark this unique challenge as cleared for the progress bar (the
+            // recycled clone keeps the same id, so dedupe is automatic).
+            clearedChallengeIds: prev.clearedChallengeIds.includes(challengeId)
+              ? prev.clearedChallengeIds
+              : [...prev.clearedChallengeIds, challengeId],
             sessionXp: prev.sessionXp + XP_PER_CORRECT,
             xp: prev.xp + XP_PER_CORRECT,
             submitting: true,
             error: null,
           }));
         } else {
-          playSfx("heartLost");
-          const heartsNow = Math.max(0, state.hearts - 1);
+          // Infinite hearts: a wrong answer never costs a life. The card is NOT
+          // discarded — `nextChallenge()` folds it into a single one-shot
+          // remedial round after the main set (see `roundMistakes`), while the
+          // FSRS/Mistakes Inbox side-effect below schedules the long-term review.
           set((prev) => ({
             wrongCount: prev.wrongCount + 1,
-            hearts: heartsNow,
-            heartsUpdatedAt: heartsNow === MAX_HEARTS ? Date.now() : prev.heartsUpdatedAt,
             submitting: true,
             error: null,
+            // Missed questions seed a single one-shot remedial round. Only
+            // the main pass feeds it — a miss during the remedial round is
+            // final and never re-queued (no infinite retry loop).
+            roundMistakes:
+              prev.inRemedial ||
+              !current ||
+              prev.roundMistakes.some((item) => item.challengeId === challengeId)
+                ? prev.roundMistakes
+                : [...prev.roundMistakes, { ...current }],
             sessionMistakes: [
               ...prev.sessionMistakes,
               {
@@ -477,7 +661,7 @@ export const useQuizStore = create<QuizState>()(
 
         try {
           const userId = state.userId ?? (await get().ensureUser());
-          const review = await submitCardReview({
+          const review = await api.submitReview({
             user_id: userId,
             challenge_id: challengeId,
             rating,
@@ -506,9 +690,53 @@ export const useQuizStore = create<QuizState>()(
           }));
           return { rating, xp: review.xp_awarded };
         } catch (error) {
+          // Offline play: the attempt is queued in localStorage and credited
+          // optimistically so a lesson never stalls behind connectivity. The
+          // pending reviews are replayed (and the server's XP/gems adopted) as
+          // soon as the connection returns.
+          if (isOffline() || (error instanceof ApiError && error.status === 0)) {
+            enqueueReview({
+              user_id: state.userId ?? "",
+              challenge_id: challengeId,
+              rating,
+              elapsed_ms: elapsedMs,
+              response_json: responseJson,
+            });
+            const estimate = XP_BY_RATING_FALLBACK[rating] ?? 0;
+            const attempt: AttemptResult = {
+              challengeId,
+              challengeType,
+              isCorrect,
+              rating,
+              xp: estimate,
+              elapsedMs,
+              at: Date.now(),
+            };
+            set((prev) => ({
+              submitting: false,
+              error: null,
+              offlinePending: prev.offlinePending + 1,
+              sessionXp: prev.sessionXp + estimate,
+              xp: prev.xp + estimate,
+              sessionAttempts: [...prev.sessionAttempts, attempt],
+            }));
+            return { rating, xp: estimate, offline: true };
+          }
           set({ submitting: false, error: messageOf(error) });
           return null;
         }
+      },
+
+      /** Replay every queued offline review; returns how many were credited. */
+      syncOfflineReviews: async () => {
+        const { userId } = get();
+        if (!userId) return 0;
+        const sent = await flushReviewQueue((submission) => api.submitReview(submission));
+        if (sent > 0) {
+          set({ offlinePending: 0 });
+          await get().refreshStats();
+        }
+        return sent;
       },
 
       /**
@@ -528,7 +756,7 @@ export const useQuizStore = create<QuizState>()(
         set({ submitting: true, error: null });
         try {
           const id = userId ?? (await ensureUser());
-          const review = await submitCardReview({
+          const review = await api.submitReview({
             user_id: id,
             challenge_id: target,
             rating,
@@ -553,22 +781,27 @@ export const useQuizStore = create<QuizState>()(
         }
       },
 
-      loseHeart: () => {
-        const heartsNow = Math.max(0, get().hearts - 1);
-        playSfx("heartLost");
-        set({ hearts: heartsNow });
-      },
-
       addXp: (amount) => set((prev) => ({ xp: prev.xp + amount, sessionXp: prev.sessionXp + amount })),
 
       nextChallenge: () => {
-        const { index, queue } = get();
+        const { index, queue, inRemedial, roundMistakes } = get();
         if (index < queue.length - 1) {
           playSfx("whoosh");
           set({ index: index + 1 });
-        } else {
-          get().finishSession();
+          return;
         }
+        // End of the main set: open the ONE-SHOT remedial round with every
+        // missed question, exactly once. Misses during it never extend it.
+        if (!inRemedial && roundMistakes.length > 0) {
+          playSfx("whoosh");
+          set({
+            queue: [...queue, ...roundMistakes.map((item) => ({ ...item }))],
+            inRemedial: true,
+            index: index + 1,
+          });
+          return;
+        }
+        get().finishSession();
       },
 
       prevChallenge: () => {
@@ -587,52 +820,28 @@ export const useQuizStore = create<QuizState>()(
               ? [...completedNodeIds, activeNodeId]
               : completedNodeIds,
         }));
+        // Pull server-authoritative gems/XP (passive gem regen included).
+        void get().refreshStats();
       },
 
       resetSession: () =>
         set({
           queue: [],
           index: 0,
+          clearedChallengeIds: [],
           sessionXp: 0,
           sessionAttempts: [],
           sessionMistakes: [],
           correctCount: 0,
           wrongCount: 0,
+          roundMistakes: [],
+          inRemedial: false,
           activeNodeId: null,
           activeNodeTitle: "",
           startedAt: null,
           finishedAt: null,
           lastReview: null,
           lastXpAward: 0,
-        }),
-
-      // -- economy ---------------------------------------------------------
-      refillHearts: async () => {
-        const { userId, gems } = get();
-        if (!userId) {
-          set({ error: "sign in first" });
-          return;
-        }
-        if (gems < HEART_REFILL_COST) {
-          set({ error: `refill costs ${HEART_REFILL_COST} gems, you have ${gems}` });
-          return;
-        }
-        try {
-          const result = await api.refillHearts(userId);
-          set({ hearts: result.hearts, gems: result.gems, error: null });
-          playSfx("fanfare");
-        } catch (error) {
-          set({ error: messageOf(error) });
-        }
-      },
-
-      grantHearts: (count = 1) =>
-        set((prev) => {
-          const hearts = Math.min(MAX_HEARTS, prev.hearts + count);
-          return {
-            hearts,
-            heartsUpdatedAt: hearts >= MAX_HEARTS ? Date.now() : prev.heartsUpdatedAt,
-          };
         }),
 
       toggleSound: () =>
@@ -642,8 +851,22 @@ export const useQuizStore = create<QuizState>()(
           return { soundEnabled: enabled };
         }),
 
+      /** Flip light/dark and sync <html data-theme> (theme.css reacts). */
+      toggleTheme: () =>
+        set((prev) => {
+          const theme: ThemeMode = prev.theme === "dark" ? "light" : "dark";
+          applyThemeToDom(theme);
+          return { theme };
+        }),
+
+      setTheme: (theme: ThemeMode) => {
+        applyThemeToDom(theme);
+        set({ theme });
+      },
+
       clearError: () => set({ error: null }),
-    }),
+      };
+    },
     {
       name: "campuslingo-progress-v2",
       storage: createJSONStorage(() => localStorage),
@@ -654,9 +877,8 @@ export const useQuizStore = create<QuizState>()(
         gems: state.gems,
         streak: state.streak,
         leagueTier: state.leagueTier,
-        hearts: state.hearts,
-        heartsUpdatedAt: state.heartsUpdatedAt,
         soundEnabled: state.soundEnabled,
+        theme: state.theme,
         completedNodeIds: state.completedNodeIds,
       }),
     },
@@ -667,8 +889,15 @@ export function useCurrentChallenge(): SessionQueueItem | null {
   return useQuizStore((state) => state.queue[state.index] ?? null);
 }
 
+/**
+ * Progress = cleared UNIQUE challenges / total UNIQUE challenges. Recycled
+ * mistake clones share their original's id, so re-attempting them neither
+ * inflates the numerator nor the denominator.
+ */
 export function useSessionProgress(): number {
-  return useQuizStore((state) =>
-    state.queue.length === 0 ? 0 : (state.index / state.queue.length) * 100,
-  );
+  return useQuizStore((state) => {
+    const totalUnique = new Set(state.queue.map((item) => item.challengeId)).size;
+    if (totalUnique === 0) return 0;
+    return (state.clearedChallengeIds.length / totalUnique) * 100;
+  });
 }

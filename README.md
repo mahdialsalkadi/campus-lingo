@@ -4,11 +4,11 @@ Duolingo-style micro-learning for university students: upload a lecture PDF, get
 gamified practice unit scheduled by FSRS-4.5.
 
 ```
-PDF slides ──▶ PyMuPDF ──▶ page-aware chunks ──▶ Qwen (Ollama, JSON-Schema decoding)
+PDF slides ──▶ PyMuPDF ──▶ page-aware chunks ──▶ Qwen GGUF (llama-server, JSON-Schema grammar)
                                                         │
                                                         ▼
-   Next.js 14 UI  ◀── FastAPI ◀── PostgreSQL 16 + pgvector (courses, nodes,
-   hearts / XP / streak / Mistakes Inbox         challenges, fsrs_cards)
+   Next.js 14 UI  ◀── FastAPI ◀── PostgreSQL 16 + pgvector (courses, lectures,
+   hearts / XP / streak / Mistakes Inbox         nodes, challenges, fsrs_cards)
         │
         └── POST /api/reviews ──▶ FSRSScheduler (DSR) ──▶ updated stability,
                                   difficulty and due_date in Postgres
@@ -24,6 +24,10 @@ model output can never reach the database or the UI.
 ### Ingestion → generation → persistence
 
 1. **`POST /api/process-lecture`** receives a PDF plus a `course_id`.
+   (The web app calls **`POST /api/process-lecture-async`** instead: the upload is
+   validated and queued immediately, and progress is polled via
+   `GET /api/ingest-jobs/{job_id}` — a 25-minute GPU batch no longer holds an
+   HTTP request open, and the UI shows real per-chunk progress.)
 2. `ingestion/parser.py` extracts text with PyMuPDF (`extract_pdf_content`),
    stripping running headers/footers, bare page numbers, inline citations and
    hyphenated line breaks, and emits per-page blocks with metadata headers
@@ -31,14 +35,18 @@ model output can never reach the database or the UI.
 3. `iterate_chunks` splits that into ordered learning chunks with sentence-level
    overlap.
 4. For each chunk, `llm/generator.py:generate_learning_bundle()` makes **one**
-   `/api/generate` call to Ollama constrained by
-   `LearningUnitBundle.model_json_schema()` (refs inlined, discriminators pinned),
-   under an Arabic academic system prompt. A rejected bundle is fed back as a
-   repair turn; if the bundle path fails entirely, the fallback path generates one
-   challenge per type in parallel, each with its own repair loop.
-5. `database.py:save_lecture_and_challenges()` writes the lecture, node,
-   challenges (JSONB) and seeds one `fsrs_cards` row per challenge, plus the
-   node embedding (`vector(1536)`) when an embedding model is available.
+   `/v1/chat/completions` call to `llama-server` (OpenAI-compatible API) constrained
+   by `LearningUnitBundle.model_json_schema()` (refs inlined, discriminators pinned)
+   via `response_format: {"type": "json_object"}` plus the GBNF `json_schema` field,
+   under a language-locked academic system prompt (output language == source
+   language). A rejected bundle is fed back as a repair turn; if the bundle path
+   fails entirely, the fallback path generates one challenge per type in parallel,
+   each with its own repair loop. Transport is a persistent `httpx.AsyncClient`
+   pool, so multi-chunk fan-out reuses warm connections.
+5. `database.py:save_pdf_lecture()` writes **one lecture per PDF**, 2-3 numbered
+   learning nodes (`"3.1 Paging Mechanics"`), challenges (JSONB), one `fsrs_cards`
+   row per challenge, and the node embeddings (`vector(1536)`) when the embedding
+   endpoint is available.
 
 ### Review loop
 
@@ -57,7 +65,13 @@ schedule (`stability`, `difficulty`, `interval_days`, `due_date`, `state`).
 | `MATCH_MADNESS` | `pairs[{term, definition}]`, `seconds` (60) | two columns, combo multiplier, shake on mismatch |
 | `SPOT_MISTAKE` | `code_or_text`, `mistake_token`, `explanation` | clickable word tokens; wrong token costs a heart and vibrates |
 | `CONTEXTUAL_CLOZE` | `sentence_with_blank`, `correct_answer`, `distractors` | word bank, instant evaluation + explanation |
-| `INTERACTIVE_STORY` | `scenario_title`, `dialogue[{speaker, text, action_prompt, options[{text, correct, feedback}]}]` | chat bubbles with branching, character reactions |
+| `MCQ_QUIZ` | `question`, `options[{text, correct}]`, `explanation` | multiple choice with instant feedback |
+| `TRUE_FALSE` | `statement`, `answer`, `explanation` | judge the statement (legacy type, render-only) |
+| `DIAGRAM_QA` | `image_url`, `diagram_ref`, `questions[{question, options}]` | zoomable slide figure + comprehension |
+
+> The chat/dialogue `INTERACTIVE_STORY` type has been retired. Generation focuses
+> on the four high-yield variants: `MCQ_QUIZ`, `SPOT_MISTAKE`,
+> `CONTEXTUAL_CLOZE` and `MATCH_MADNESS`.
 
 ---
 
@@ -81,7 +95,7 @@ campus-lingo/
 │       ├── schema.py               # Pydantic contracts (payloads, bundle, API models)
 │       ├── main.py                 # FastAPI app and endpoints
 │       ├── ingestion/parser.py     # PyMuPDF extraction, cleaning, chunking
-│       ├── llm/generator.py        # Ollama client, prompts, schema-constrained decoding
+│       ├── llm/generator.py        # llama-server client, prompts, schema-constrained decoding
 │       ├── fsrs/scheduler.py       # FSRS-4.5 (DSR) + FSRSScheduler facade
 │       └── tests/
 │           ├── conftest.py         # path setup + synthetic lecture PDF fixtures
@@ -111,13 +125,59 @@ docker compose up -d          # PostgreSQL 16 + pgvector on :5432, Redis on :637
 the full schema. The app also bootstraps idempotently at startup, so a database
 created by hand works too.
 
-### 2. LLM runtime
+### 2. LLM runtime (llama.cpp) — four selectable Qwen 3.5 tiers
+
+Each tier of the Qwen 3.5 family runs as its own `llama-server` on a fixed
+port, all hardware-tuned for the 14GB-VRAM BC-250. Pick any combination at
+boot; the dashboard lets every upload choose which tier generates it, and the
+backend routes the request to that tier's endpoint with the generic model id
+`"default"` (swapping GGUFs never touches application code).
+
+| Choice | Name | Port | GGUF (`models/`) | `-np` | Best for |
+| --- | --- | --- | --- | --- | --- |
+| `1` / `800m` | Qwen 3.5 0.8B | 8081 | `qwen3.5-0.8b-instruct-q4_k_m.gguf` | 6 | high concurrency, instant quizzes |
+| `2` / `2b` | Qwen 3.5 2B | 8082 | `qwen3.5-2b-instruct-q4_k_m.gguf` | 4 | fast generation, lightweight |
+| `3` / `4b` *(default)* | Qwen 3.5 4B (DeltaNet) | 8083 | `qwen3.5-4b-instruct-q4_k_m.gguf` | 2 | DeltaNet 3:1, code challenges & logic |
+| `4` / `9b` | Qwen 3.5 9B | 8084 | `qwen3.5-9b-instruct-q4_k_m.gguf` | 1 | deep reasoning, heavy academic lectures |
 
 ```bash
-ollama serve                 # http://localhost:11434
-ollama pull qwen3.5:9b       # the generation model (see "Moving to the GPU rig")
-ollama pull nomic-embed-text # embeddings for node vectors (optional but recommended)
+./run.sh                      # interactive menu (10s timeout) -> 4B default
+./run.sh --model 9b           # CLI: a single tier
+./run.sh --model "1 3"        # CLI: several tiers at once
+LLAMA_TIERS=all ./run.sh      # env: every tier
 ```
+
+Every tier launches with the same BC-250 speed flags:
+
+```bash
+llama-server \
+  -m models/qwen3.5-4b-instruct-q4_k_m.gguf \
+  --host 0.0.0.0 --port 8083 \
+  -c 4096 \
+  -fa on \
+  -ctk q4_0 -ctv q4_0 \
+  -ngl 99 \
+  -np 2 \
+  -t 8 \
+  --mlock \
+  --embeddings --pooling mean
+```
+
+`--pooling mean` enables the `/v1/embeddings` endpoint (Qwen 3.5 ships without a
+default pooling type). Structured output rides on the top-level `json_schema`
+field as a JSON object, and thinking mode is disabled per request
+(`chat_template_kwargs.enable_thinking=false`) so completion tokens reach the
+JSON answer instead of `reasoning_content`. `-fa on` (Flash Attention) plus the 4-bit KV cache (`-ctk/-ctv q4_0`) cut the memory
+bandwidth bottleneck; `-ngl 99` offloads every layer to the GPU; `-np` scales
+with the tier (6 parallel slots for the 0.8B down to 1 for the 9B, which gets
+the full VRAM budget for deep reasoning); `-c 4096` is fixed across tiers. The
+selected tiers are exported as `SELECTED_MODEL_TIER`/`SELECTED_TIERS`, surfaced
+per tier in `GET /health` (`llm.tiers`), and offered in the dashboard's upload
+form. Tiers whose GGUF is missing are skipped with the expected download path;
+if none remain, startup fails fast. Ports and GGUF paths are env-overridable
+via `LLAMA_TIER1_PORT..LLAMA_TIER4_PORT` and `LLAMA_TIER1_MODEL..LLAMA_TIER4_MODEL`.
+A remote GPU host still works: set `LLAMA_SERVER_URL` and every tier's client
+pins to that endpoint.
 
 ### 3. Backend
 
@@ -129,7 +189,7 @@ set -a; source ../../.env; set +a
 ./.venv/bin/uvicorn main:app --reload --port 8000
 ```
 
-Check it: `curl localhost:8000/health` reports database, Ollama and FSRS status.
+Check it: `curl localhost:8000/health` reports database, llama-server and FSRS status.
 
 ### 4. Web app
 
@@ -162,21 +222,22 @@ The bundle path is schema-constrained, so a larger model mostly buys you *better
 challenges, not different plumbing. What changes on the GPU box:
 
 ```bash
-ollama pull qwen3.5:9b          # generation model (~6.6 GB)
-ollama pull nomic-embed-text    # embeddings (~275 MB) — currently missing on CPU-only hosts
+# Download the Qwen 3.5 9B instruct GGUF (Q4_K_M is the quality/speed sweet spot)
+# and let run.sh start its dedicated server:
+LLAMA_TIERS=4 ./run.sh
+# ...or point every tier at a remote box already serving llama.cpp:
+export LLAMA_SERVER_URL=http://<gpu-host>:8084
 ```
 
-Then point the service at them:
+Then point the service at it:
 
 ```bash
-export OLLAMA_MODEL=qwen3.5:9b          # per-type fallback generator
-export OLLAMA_BUNDLE_MODEL=qwen3.5:9b   # primary bundle generator
-export OLLAMA_HOST=http://<gpu-host>:11434   # if Ollama runs on another machine
+export LLAMA_SERVER_URL=http://<gpu-host>:8083    # any tier port, e.g. 4B
 ```
 
 On CPU-only hardware a 9B model can exceed 300 s per structured request; the
-GPU rig is where real generation quality gets validated. `OLLAMA_THINK=false`
-(default) keeps reasoning traces off, which matters most for latency.
+GPU rig is where real generation quality gets validated. `-fa on` + 4-bit KV cache
++ `-ngl 99` are what unlock real token throughput.
 
 ---
 
@@ -193,18 +254,25 @@ them through your process manager.
 | `DATABASE_URL` | `postgresql+asyncpg://postgres:password123@localhost:5432/campuslingo` | asyncpg DSN |
 | `SQL_ECHO` | *(unset)* | log every SQL statement |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `10` / `20` | connection pool sizing |
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama base URL |
-| `OLLAMA_MODEL` | `qwen2.5:7b-instruct` | model for the fallback per-type generator |
-| `OLLAMA_BUNDLE_MODEL` | `qwen2.5:7b` | model for the primary bundle generator |
-| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | embedding model for node vectors |
+| `SELECTED_MODEL_TIER` | `4B` | exported by run.sh from the boot menu/CLI/env |
+| `SELECTED_MODEL_PATH` | *(set by run.sh)* | GGUF path of the loaded tier |
+| `LLAMA_SERVER_URL` | *(unset)* | pins every tier's client to one endpoint (e.g. a remote GPU host); unset = per-tier ports |
+| `LLAMA_TIER1_PORT..LLAMA_TIER4_PORT` | `8081..8084` | per-tier llama-server ports (must match run.sh) |
+| `LLAMA_TIER1_MODEL..LLAMA_TIER4_MODEL` | Qwen 3.5 GGUFs | per-tier model paths (must match run.sh) |
+| `LLAMA_MODEL` | `default` | generic model id echoed in requests (GGUF-agnostic) |
+| `MODEL_TIER` | *(unset)* | legacy alias of `LLAMA_TIERS` for run.sh (e.g. `4b`) |
+| `MODEL_DIR` | `models` | central GGUF directory used by run.sh |
+| `LLAMA_EMBED_MODEL` | *(empty)* | model field for `/v1/embeddings` (defaults to the chat model) |
 | `EMBEDDING_DIM` | `1536` | must match `vector(1536)`; shorter vectors are zero-padded |
-| `OLLAMA_TIMEOUT` | `300` | seconds per generation request |
-| `OLLAMA_EMBED_TIMEOUT` | `120` | seconds per embedding request |
-| `OLLAMA_MAX_ATTEMPTS` | `3` | attempts per challenge/unit before it is dropped |
-| `OLLAMA_MAX_SOURCE_CHARS` | `7000` | lecture text sent per request |
-| `OLLAMA_THINK` | `false` | set `true` to allow reasoning traces |
+| `LLAMA_TIMEOUT` | `300` | seconds per generation request |
+| `LLAMA_EMBED_TIMEOUT` | `120` | seconds per embedding request |
+| `LLAMA_MAX_ATTEMPTS` | `3` | attempts per challenge/unit before it is dropped |
+| `LLAMA_MAX_SOURCE_CHARS` | `7000` | lecture text sent per request |
+| `LLAMA_TEMPERATURE` | `0.2` | sampling temperature (low for schema-faithful JSON) |
+| `LLAMA_TOP_P` | `0.9` | nucleus sampling cutoff |
+| `LLAMA_POOL_KEEPALIVE` / `LLAMA_POOL_MAX_CONNECTIONS` | `8` / `16` | httpx connection-pool sizing |
 | `MAX_UPLOAD_BYTES` | `83886080` | PDF upload ceiling (80 MB) |
-| `MAX_NODES_PER_LECTURE` | `25` | chunks generated per upload |
+| `MAX_NODES_PER_LECTURE` | `3` | thematic nodes consolidated per upload (2-3) |
 | `GENERATION_CONCURRENCY` | `2` | parallel chunk generations during upload |
 | `CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | comma-separated allow-list |
 | `LOG_LEVEL` | `INFO` | root log level |
@@ -223,8 +291,10 @@ them through your process manager.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/health` | database, Ollama and FSRS status |
-| `POST` | `/api/process-lecture` | multipart `file` + `course_id` → parse, generate, persist; returns the node and challenges |
+| `GET` | `/health` | database, llama-server and FSRS status |
+| `POST` | `/api/process-lecture` | multipart `file` + `course_id` → parse, generate (chunks in parallel), persist; returns the node and challenges |
+| `POST` | `/api/process-lecture-async` | same pipeline as a background job; returns `202 {job_id}` immediately |
+| `GET` | `/api/ingest-jobs/{job_id}` | poll a background ingestion job: status, `done_chunks/total_chunks`, per-chunk results |
 | `POST` | `/api/reviews` | `{user_id, challenge_id, rating}` → DSR recalculation + rewards |
 | `GET` | `/api/nodes/{node_id}/challenges` | all challenges of one learning node |
 | `POST` | `/api/users` | upsert a user by email (idempotent) |

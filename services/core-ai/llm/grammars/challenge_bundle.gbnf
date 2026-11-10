@@ -1,0 +1,25 @@
+root ::= object
+
+ws ::= [ \t\n]*
+object ::= "{" ws kv-unit-id ws "," ws kv-concept-title ws "," ws kv-difficulty ws "," ws kv-challenges ws "}"
+kv-unit-id ::= "\"unit_id\"" ws ":" ws string
+kv-concept-title ::= "\"concept_title\"" ws ":" ws string
+kv-difficulty ::= "\"difficulty_level\"" ws ":" ws difficulty-int
+difficulty-int ::= "1" | "2" | "3" | "4" | "5"
+kv-challenges ::= "\"challenges\"" ws ":" ws "[" ws challenge ("," ws challenge)* "]"
+
+challenge ::= "{" ws kv-type ws "," ws kv-instructions ws ("," ws rest-field)* ws "}"
+kv-type ::= "\"type\"" ws ":" ws type-value
+type-value ::= "\"MCQ_QUIZ\"" | "\"SPOT_MISTAKE\"" | "\"CONTEXTUAL_CLOZE\"" | "\"MATCH_MADNESS\"" | "\"SWIPE_BOOLEAN\"" | "\"SPOT_IMPOSTER\"" | "\"TAP_TO_FILL\"" | "\"TRUE_FALSE\"" | "\"BOSS_FIGHT\"" | "\"DIAGRAM_QA\""
+kv-instructions ::= "\"instructions\"" ws ":" ws string
+rest-field ::= json-key ws ":" ws value
+json-key ::= "\"question\"" | "\"options\"" | "\"explanation\"" | "\"one_liner_rationale\"" | "\"code_or_text\"" | "\"mistake_token\"" | "\"sentence_with_blank\"" | "\"correct_answer\"" | "\"distractors\"" | "\"pairs\"" | "\"seconds\"" | "\"statement\"" | "\"answer\"" | "\"statements\"" | "\"boss_name\"" | "\"boss_emoji\"" | "\"seconds_per_question\"" | "\"questions\"" | "\"image_url\"" | "\"diagram_ref\"" | "\"caption\""
+value ::= string | number | bool | null | object-g | array
+object-g ::= "{" ws (string ws ":" ws value ("," ws string ws ":" ws value)* )? "}"
+array ::= "[" ws (value ("," ws value)*)? "]"
+bool ::= "true" | "false"
+null ::= "null"
+
+string ::= "\"" ([^"\\\x00-\x1f] | "\\" ("\"" | "\\" | "/" | "b" | "f" | "n" | "r" | "t" | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]))* "\""
+
+number ::= "-"? ([0-9] | [1-9] [0-9]*) ("." [0-9]+)? ([eE] "-"? [0-9]+)?

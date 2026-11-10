@@ -11,6 +11,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { CheckCircle2, Eraser, XCircle } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import RichContent from "@/components/RichContent";
 import {
   shuffle,
   type ChallengeComponentProps,
@@ -139,7 +140,7 @@ export default function ContextualCloze({
           >
             {evaluation === "correct" ? payload.correct_answer : (selected ?? "…")}
           </span>
-          {after}
+          <RichContent text={after} inline />
         </p>
       </motion.div>
 
@@ -221,7 +222,9 @@ export default function ContextualCloze({
               )}
             </p>
             <p className="mt-2 font-body text-sm leading-relaxed text-ink-soft">
-              {payload.explanation}
+              <RichContent
+                text={payload.one_liner_rationale?.trim() || payload.explanation}
+              />
             </p>
           </motion.div>
         )}

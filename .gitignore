@@ -10,3 +10,20 @@ services/core-ai/.venv/
 *.py[cod]
 *.log
 uploads/
+.freebuff/
+
+# Models & Weights
+models/*.gguf
+models/*.bin
+*.gguf
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# TypeScript & Test Caches
+*.tsbuildinfo
+.pytest_cache/
+services/core-ai/.pytest_cache/
+
